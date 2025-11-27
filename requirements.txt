@@ -1,7 +1,9 @@
 ultralytics
 mmdet
+mmaction2  # Для action recognition
+opencv-python
+sqlite3  # Или pymongo для MongoDB
 gradio
 streamlit
-torch
-torchvision
-pytest  
+plotly  # Для дашборда
+torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121  # GPU
