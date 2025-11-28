@@ -9,4 +9,4 @@
 * ui/ : Интерфейсы на Gradio и Streamlit.
 * tests/ : Тесты.
 * data/ : Датасеты.
-* configs/ : Конфигурации.
+* configs/ : Конфигурации.(WIP)
