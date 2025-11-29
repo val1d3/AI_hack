@@ -23,18 +23,19 @@ st.sidebar.header("Настройки")
 db_enabled = st.sidebar.checkbox("Сохранять в базу данных", value=True)
 db_path = st.sidebar.text_input("Путь к базе данных", "platform_analysis.db")
 
+# Выбор модели YOLO
+model_type = st.sidebar.selectbox(
+    "Модель YOLO",
+    ["yolov8n.pt", "yolov8s.pt", "yolov8m.pt", "yolov8l.pt"],
+    index=2  # по умолчанию yolov8m.pt
+)
+
 # Основные настройки
-confidence = st.sidebar.slider("Confidence", 0.0, 1.0, 0.4)
+confidence = st.sidebar.slider("Confidence", 0.0, 1.0, 0.35)
 line_y = st.sidebar.slider("Позиция линии", 0, 1080, 600)
 skip_frames = st.sidebar.slider("Пропускать кадров", 1, 10, 2)
 resize_factor = st.sidebar.slider("Уменьшение разрешения", 0.3, 1.0, 0.6)
 disable_ocr = st.sidebar.checkbox("Отключить OCR (распознавание времени)", value=False)
-
-# Настройки области OCR
-ocr_x = st.sidebar.slider("X-позиция OCR", 0, 1000, 10)
-ocr_y = st.sidebar.slider("Y-позиция OCR", 0, 1000, 10)
-ocr_width = st.sidebar.slider("Ширина OCR", 100, 800, 300)
-ocr_height = st.sidebar.slider("Высота OCR", 20, 200, 50)
 
 # Настройки цветовой фильтрации поезда
 st.sidebar.subheader("Цветовая фильтрация поезда")
@@ -450,12 +451,12 @@ def load_previous_analyses():
 if db_enabled:
     init_database()
 
-# Модель
-model = YOLO("yolov8n.pt")
+# Модель YOLO
+model = YOLO(model_type)
 
 # OCR ридер
 reader = None
-if not disable_ocr:
+if not disable_ocr or train_number_ocr_enabled:
     try:
         reader = easyocr.Reader(['en', 'ru'], gpu=False)
     except Exception as e:
@@ -887,17 +888,15 @@ def detect_train_colors(roi):
     
     return gray_percent, orange_percent, red_percent, combined_percent
 
-def is_in_train_zone(x1, y1, x2, y2, frame_width, frame_height):
-    """Проверяет, находится ли объект в зоне детекции поезда"""
+# === ЖЁСТКАЯ ЗОНА ПОЕЗДА ПО ТВОЕМУ КАДРУ ===
+def is_in_train_zone(x1, y1, x2, y2, w, h):
     zone_x1 = train_zone_x
-    zone_x2 = train_zone_x + train_zone_width
+    zone_x2 = original_w
     zone_y1 = train_zone_y
-    zone_y2 = train_zone_y + train_zone_height
-
+    zone_y2 = original_h
     center_x = (x1 + x2) / 2
     center_y = (y1 + y2) / 2
-    in_zone = (zone_x1 <= center_x <= zone_x2) and (zone_y1 <= center_y <= zone_y2)
-    return in_zone, (zone_x1, zone_y1, zone_x2, zone_y2)
+    return (zone_x1 <= center_x <= zone_x2) and (zone_y1 <= center_y <= zone_y2), (zone_x1, zone_y1, zone_x2, zone_y2)
 
 # ✅ ДОБАВЛЕНО: Функция для расчета статистики времени пребывания
 def calculate_stay_statistics(people_data, occupancy):
@@ -984,10 +983,6 @@ if uploaded_file:
         "skip_frames": skip_frames,
         "resize_factor": resize_factor,
         "disable_ocr": disable_ocr,
-        "ocr_x": ocr_x,
-        "ocr_y": ocr_y,
-        "ocr_width": ocr_width,
-        "ocr_height": ocr_height,
         "reid_threshold": reid_threshold,
         "enable_reid": enable_reid,
         "analyze_clothing": analyze_clothing,
@@ -1010,11 +1005,10 @@ if uploaded_file:
     frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     duration = frame_count / fps if fps > 0 else 0
     
-    # === АВТОМАТИЧЕСКАЯ ЗОНА ПОЕЗДА (ПРАВАЯ ЧАСТЬ КАДРА) ===
-    # Поезд всегда справа и в нижних ~70% кадра
-    train_zone_x = int(original_w * 0.55)          # начиная с 55% ширины
-    train_zone_width = original_w - train_zone_x    # до конца кадра
-    train_zone_y = int(original_h * 0.25)           # от 25% высоты (чтобы не цеплять небо/крышу)
+    # === ЖЁСТКАЯ ЗОНА ПОЕЗДА ПО ТВОЕМУ КАДРУ ===
+    train_zone_x = int(original_w * 0.58)
+    train_zone_y = int(original_h * 0.15)
+    train_zone_width = original_w - train_zone_x
     train_zone_height = original_h - train_zone_y
     
     st.sidebar.info(f"Автоматическая зона поезда: {train_zone_x}x{train_zone_y} - {train_zone_width}x{train_zone_height}")
@@ -1060,42 +1054,54 @@ if uploaded_file:
         else:
             process_frame = frame
 
-        # Распознавание времени
+        # === OCR ВРЕМЕНИ — ТОЛЬКО ИЗ ЛЕВОГО ВЕРХНЕГО УГЛА (18:23:51) ===
         timestamp_str = "00:00:00"
         current_dt = datetime.now()
-        
+
         if not disable_ocr and reader is not None:
-            try:
-                y1 = max(0, min(ocr_y, frame.shape[0] - ocr_height))
-                y2 = min(frame.shape[0], y1 + ocr_height)
-                x1 = max(0, min(ocr_x, frame.shape[1] - ocr_width))
-                x2 = min(frame.shape[1], x1 + ocr_width)
-                
-                crop = frame[y1:y2, x1:x2]
+            # Точная зона времени на твоей камере
+            x1, y1 = 30, 15
+            x2, y2 = 380, 85
+            crop = frame[y1:y2, x1:x2]
+            
+            if crop.size > 0:
+                # Предобработка: усиливаем контраст + инверсия
                 gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-                enhanced = cv2.convertScaleAbs(gray, alpha=1.5, beta=0)
-                blurred = cv2.GaussianBlur(enhanced, (3, 3), 0)
+                _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                enhanced = cv2.bitwise_not(thresh)  # белый текст на чёрном — EasyOCR любит
                 
-                result = reader.readtext(blurred, detail=0, paragraph=True)
+                # Читаем только цифры и двоеточие
+                result = reader.readtext(enhanced, detail=0, allowlist='0123456789:', paragraph=False)
                 
                 if result:
-                    timestamp_str = result[0]
-                    time_formats = ["%H:%M:%S", "%H:%M", "%I:%M:%S %p", "%I:%M %p"]
-                    
-                    for fmt in time_formats:
+                    text = " ".join(result)
+                    match = re.search(r'(\d{2}:\d{2}:\d{2})', text)
+                    if match:
+                        timestamp_str = match.group(1)
                         try:
-                            current_time = datetime.strptime(timestamp_str, fmt).time()
-                            current_dt = datetime.combine(datetime.today(), current_time)
-                            break
+                            t = datetime.strptime(timestamp_str, "%H:%M:%S")
+                            current_dt = datetime.combine(datetime.today(), t.time())
                         except:
-                            continue
-                            
-            except Exception as e:
-                st.sidebar.warning(f"Ошибка OCR: {e}")
+                            pass
+
+        # Если OCR не сработал — попробуем fallback по цвету (иногда шрифт меняется)
+        if timestamp_str == "00:00:00":
+            # Просто берём время из метаданных видео (если есть)
+            seconds = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000
+            mins, secs = divmod(int(seconds), 60)
+            hrs, mins = divmod(mins, 60)
+            timestamp_str = f"{hrs:02d}:{mins:02d}:{secs:02d}"
 
         # Детекция объектов
-        results = model.track(process_frame, persist=True, conf=confidence, 
-                            classes=[0, 2, 3, 5, 6, 7], tracker="bytetrack.yaml", verbose=False)[0]
+        results = model.track(
+            process_frame,
+            persist=True,
+            conf=0.35,           # снижаем порог
+            iou=0.5,
+            classes=[0, 2, 3, 5, 6, 7],  # все классы для детекции поездов и людей
+            imgsz=640,
+            verbose=False
+        )[0]
         
         # Создаем Detections объект
         if results.boxes.id is not None:
@@ -1148,9 +1154,6 @@ if uploaded_file:
                         reid_matches[tracker_id] = matched_id
                         reid_storage.update_person(matched_id, features)
                         current_people_tracks.append(matched_id)
-                        
-                        # Сохраняем информацию об одежде для отображения
-                        clothing_info = f"Match: {similarity:.2f}"
                     else:
                         # Новый человек или нет хорошего совпадения
                         if tracker_id not in id_mapping:
@@ -1191,7 +1194,7 @@ if uploaded_file:
                     "ID": int(person_id), 
                     "Появление": current_dt.strftime("%H:%M:%S"), 
                     "Исчезновение": "-", 
-                    "Ожидание": "0.0 мин",  # ИСПРАВЛЕНО: правильный формат
+                    "Ожидание": "0.0 мин",
                     "ReID": "✓" if enable_reid and analyze_clothing else "✗",
                     "ClothingFeatures": json.dumps({"analyzed": analyze_clothing})
                 })
@@ -1212,7 +1215,6 @@ if uploaded_file:
                             wait_seconds = (t2 - t1).total_seconds()
                             wait_minutes = wait_seconds / 60
                             
-                            # Форматируем правильно - исправляем "мм" на "мин"
                             row["Ожидание"] = f"{wait_minutes:.1f} мин"
                         except Exception as e:
                             row["Ожидание"] = "0.0 мин"
@@ -1265,37 +1267,42 @@ if uploaded_file:
                         best_train_info = f"G:{gray_p:.0f}% O:{orange_p:.0f}% R:{red_p:.0f}% C:{combined_p:.0f}%"
                         train_detected = True
 
-        # Распознавание номера поезда
+        # --- РАСПОЗНАВАНИЕ НОМЕРА ПОЕЗДА — ТОЧНАЯ ЗОНА ПОД ЭП20 ---
         current_train_number = None
         if train_detected and train_number_ocr_enabled and reader is not None:
-            # Область для номера поезда — обычно вверху вагона или сбоку
-            number_roi_x = int(original_w * 0.6)
-            number_roi_y = int(original_h * 0.3)
-            number_roi_w = int(original_w * 0.35)
-            number_roi_h = int(original_h * 0.15)
+            # Точная зона номера на ЭП20 — нижняя часть лобового стекла
+            num_x = int(original_w * 0.62)
+            num_y = int(original_h * 0.68)
+            num_w = int(original_w * 0.28)
+            num_h = int(original_h * 0.12)
             
-            crop = frame[number_roi_y:number_roi_y+number_roi_h, 
-                         number_roi_x:number_roi_x+number_roi_w]
+            crop = frame[num_y:num_y + num_h, num_x:num_x + num_w]
             
             if crop.size > 0:
                 gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-                enhanced = cv2.convertScaleAbs(gray, alpha=2.0, beta=30)
-                result = reader.readtext(enhanced, allowlist='0123456789АВЕКМНОРСТУХABEKMHOPCTYX', detail=0)
+                # Усиливаем контраст + бинаризация
+                enhanced = cv2.convertScaleAbs(gray, alpha=3.0, beta=50)
+                _, thresh = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                
+                result = reader.readtext(thresh, detail=0, allowlist='0123456789ЭПАВЕКМНОРСТУХ')
                 
                 if result:
-                    text = " ".join(result).upper()
-                    # Фильтруем типичные номера электропоездов
-                    match = re.search(r'\b[А-ЯA-Z]{0,3}\d{3,4}[А-ЯA-Z]?\b', text)
-                    if match:
-                        current_train_number = match.group(0)
+                    text = "".join(result).upper()
+                    # Ищем паттерн: ЭП20, ЭП2Д, 076, 101 и т.д.
+                    if 'ЭП20' in text or 'ЭП2Д' in text:
+                        train_number = re.sub(r'[^ЭП0-9]', '', text)
+                    elif re.search(r'\d{3,4}', text):
+                        train_number = re.search(r'\d{3,4}', text).group(0)
                     else:
-                        current_train_number = result[0] if len(result) > 0 else None
+                        train_number = text[:6]  # fallback
+                    current_train_number = train_number
 
+            # Отображаем номер поезда
             if current_train_number:
                 train_number = current_train_number
-                cv2.putText(frame, f"Поезд: {train_number}", (10, 210), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
-                st.sidebar.success(f"Номер поезда: {train_number}")
+                cv2.putText(frame, f"Train: {train_number}", (10, 330), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 3)
+                st.sidebar.success(f"Поезд: {train_number}")
 
         # Обработка событий поезда
         if train_detected and not train_present:
@@ -1315,34 +1322,27 @@ if uploaded_file:
             train_number = None
             st.sidebar.info(f"Поезд уехал в {current_dt.strftime('%H:%M:%S')}")
 
-        # === ОПРЕДЕЛЕНИЕ ЛЮДЕЙ ВОЗЛЕ ПОЕЗДА ===
+        # === ЛЮДИ ВОЗЛЕ ПОЕЗДА — РАСШИРЯЕМ БУФЕР ===
         people_near_train = 0
-        near_train_ids = []
+        buffer_pixels = int(original_w * 0.18)  # ~300 пикселей при FullHD
 
-        if train_detected:
-            train_left = train_zone_x
-            buffer = int(original_w * 0.08)  # ~150px при FullHD
-            
-            for i, (x1, y1, x2, y2) in enumerate(detections.xyxy):
-                if detections.class_id[i] != 0:  # не человек
-                    continue
-                person_center_x = (x1 + x2) / 2
+        for i, (x1, y1, x2, y2) in enumerate(detections.xyxy):
+            if detections.class_id[i] != 0:
+                continue
                 
-                if person_center_x >= train_left - buffer:
-                    people_near_train += 1
-                    # Опционально: сохраняем ID
-                    tracker_id = int(detections.tracker_id[i]) if detections.tracker_id is not None else 0
-                    display_id = id_mapping.get(tracker_id, tracker_id) if enable_reid else tracker_id
-                    near_train_ids.append(display_id)
-                    
-                    # Подсвечиваем таких людей красным
-                    cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 0, 255), 3)
-                    cv2.putText(frame, "NEAR TRAIN", (int(x1), int(y1)-30), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+            person_center_x = (x1 + x2) / 2
+            person_center_y = (y1 + y2) / 2
+            
+            # Человек считается "возле поезда", если он левее края поезда на 300 пикселей
+            if person_center_x >= train_zone_x - buffer_pixels and person_center_x <= original_w:
+                people_near_train += 1
+                # Подсвечиваем красным
+                cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 0, 255), 4)
+                cv2.putText(frame, "NEAR TRAIN", (int(x1), int(y1)-15), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
-            # Обновляем максимум
-            if people_near_train > max_people_near_train:
-                max_people_near_train = people_near_train
+        # Обновляем максимум
+        if people_near_train > max_people_near_train:
+            max_people_near_train = people_near_train
 
         # Сохраняем данные о близости к поезду
         train_proximity_data.append({
@@ -1353,16 +1353,17 @@ if uploaded_file:
         # Линия входа/выхода
         line.trigger(detections=detections)
         
-        # Визуализация зоны поезда на кадре
-        zone_x1, zone_y1, zone_x2, zone_y2 = is_in_train_zone(0, 0, 0, 0, original_w, original_h)[1]
-        cv2.rectangle(frame, (zone_x1, zone_y1), (zone_x2, zone_y2), (0, 255, 255), 2)
-        cv2.putText(frame, "TRAIN ZONE", (zone_x1, zone_y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        # Рисуем зону поезда
+        zone_coords = (train_zone_x, train_zone_y, original_w, original_h)
+        cv2.rectangle(frame, (zone_coords[0], zone_coords[1]), (zone_coords[2], zone_coords[3]), (0, 255, 255), 3)
+        cv2.putText(frame, "TRAIN ZONE", (zone_coords[0] + 10, zone_coords[1] + 40), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 3)
         
         # Аннотации
         frame = box_annotator.annotate(scene=frame, detections=detections)
         frame = line_annotator.annotate(frame, line)
 
-        # Отображение ID с учетом ReID и информации об одежде
+        # Отображение ID с учетом ReID
         if detections.tracker_id is not None:
             for i, (x1, y1, x2, y2) in enumerate(detections.xyxy):
                 class_id = detections.class_id[i]
@@ -1371,19 +1372,8 @@ if uploaded_file:
                 # Определяем ID для отображения
                 if class_id == 0 and enable_reid and analyze_clothing:  # Человек с включенным ReID
                     display_id = id_mapping.get(tracker_id, tracker_id)
-                    
-                    # Получаем информацию о совпадении
-                    match_info = ""
-                    if tracker_id in reid_matches:
-                        matched_id = reid_matches[tracker_id]
-                        match_info = f" (Matched: {matched_id})"
-                    
-                    id_text = f"Person {display_id}{match_info}"
+                    id_text = f"Person {display_id}"
                     color = (0, 255, 0)  # Зеленый для людей с ReID
-                    
-                    # Рисуем bounding box с информацией об одежде
-                    cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
-                    
                 elif class_id == 0:  # Человек без ReID
                     display_id = tracker_id
                     id_text = f"Person {display_id}"
@@ -1405,19 +1395,20 @@ if uploaded_file:
                            0.5, color, 2)
 
         # Надпись времени и информации
-        cv2.putText(frame, f"Time: {timestamp_str}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        cv2.putText(frame, f"People: {people_count}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        cv2.putText(frame, f"Train: {'Yes' if train_present else 'No'}", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        cv2.putText(frame, f"ReID: {'ON' if enable_reid else 'OFF'}", (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        cv2.putText(frame, f"Clothing Analysis: {'ON' if analyze_clothing else 'OFF'}", (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+        cv2.putText(frame, f"TIME: {timestamp_str}", (10, 30), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
+        cv2.putText(frame, f"People: {people_count}", (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 3)
+        cv2.putText(frame, f"Train: {'Yes' if train_present else 'No'}", (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 3)
+        cv2.putText(frame, f"ReID: {'ON' if enable_reid else 'OFF'}", (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 3)
+        
         if train_detected:
-            cv2.putText(frame, f"Train Colors: {best_train_info}", (10, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+            cv2.putText(frame, f"Train Colors: {best_train_info}", (10, 190), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 3)
         if train_number:
-            cv2.putText(frame, f"Поезд: {train_number}", (10, 210), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+            cv2.putText(frame, f"Train: {train_number}", (10, 230), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 3)
         
         # Выводим на экран информацию о людях возле поезда
-        cv2.putText(frame, f"Возле поезда: {people_near_train}", (10, 240), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+        cv2.putText(frame, f"Near train: {people_near_train}", (10, 370), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
 
         stframe.image(frame, channels="BGR")
         progress.progress(min(frame_idx / frame_count, 1.0))
@@ -1613,7 +1604,7 @@ if uploaded_file:
     st.write(f"Вошло: {line.in_count} Вышло: {line.out_count}")
 
     # Дополнительно: кнопка для экспорта суммарной статистики
-    if st.button("📥 Экспорт суммарной статистики ожидания"):
+    if st.button("📥 Экспорт суммарной статистики"):
         summary_data = {
             "Общее время ожидания (мин)": total_waiting_time,
             "Всего людей": total_people,
