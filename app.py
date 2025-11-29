@@ -611,4 +611,3 @@ if uploaded_file:
 
     st.subheader("Вход/Выход")
     st.write(f"Вошло: {line.in_count} Вышло: {line.out_count}")
-    ///фыва
