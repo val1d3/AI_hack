@@ -1,3 +1,0 @@
-model_type: hog  # или yolo
-confidence_threshold: 0.5
-video_path: data/factory_video.mp4
