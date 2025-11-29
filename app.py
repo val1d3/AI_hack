@@ -10,11 +10,19 @@ import tempfile
 import numpy as np
 from collections import OrderedDict
 import os
+import sqlite3
+import json
+from contextlib import contextmanager
 
 # --- Настройки ---
 st.title("🚉 Анализ видео с железнодорожной платформы")
 st.sidebar.header("Настройки")
 
+# Настройки базы данных
+db_enabled = st.sidebar.checkbox("Сохранять в базу данных", value=True)
+db_path = st.sidebar.text_input("Путь к базе данных", "platform_analysis.db")
+
+# ... остальные настройки (оставьте без изменений) ...
 confidence = st.sidebar.slider("Confidence", 0.0, 1.0, 0.4)
 line_y = st.sidebar.slider("Позиция линии", 0, 1080, 600)
 skip_frames = st.sidebar.slider("Пропускать кадров", 1, 10, 2)
@@ -50,7 +58,220 @@ st.sidebar.subheader("Настройки ReID")
 reid_threshold = st.sidebar.slider("Порог ReID сходства", 0.1, 1.0, 0.6)
 enable_reid = st.sidebar.checkbox("Включить ReID", value=True)
 
-# Модель
+# --- База данных ---
+@contextmanager
+def get_db_connection():
+    """Контекстный менеджер для подключения к БД"""
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+def init_database():
+    """Инициализация базы данных"""
+    with get_db_connection() as conn:
+        # Таблица для информации о видео
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS videos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                filename TEXT NOT NULL,
+                processed_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                frame_count INTEGER,
+                processed_frames INTEGER,
+                duration_seconds REAL,
+                resolution TEXT,
+                fps REAL
+            )
+        ''')
+        
+        # Таблица для данных о людях
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS people (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                video_id INTEGER,
+                person_id INTEGER NOT NULL,
+                appearance_time TEXT NOT NULL,
+                disappearance_time TEXT,
+                waiting_minutes REAL,
+                reid_enabled BOOLEAN,
+                FOREIGN KEY (video_id) REFERENCES videos (id)
+            )
+        ''')
+        
+        # Таблица для событий поездов
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS train_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                video_id INTEGER,
+                arrival_time TEXT NOT NULL,
+                departure_time TEXT,
+                duration_seconds REAL,
+                FOREIGN KEY (video_id) REFERENCES videos (id)
+            )
+        ''')
+        
+        # Таблица для загруженности платформы
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS occupancy (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                video_id INTEGER,
+                timestamp TEXT NOT NULL,
+                people_count INTEGER NOT NULL,
+                FOREIGN KEY (video_id) REFERENCES videos (id)
+            )
+        ''')
+        
+        # Таблица для анализа цветов поезда
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS color_analysis (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                video_id INTEGER,
+                frame_index INTEGER NOT NULL,
+                gray_percent REAL,
+                orange_percent REAL,
+                red_percent REAL,
+                combined_percent REAL,
+                FOREIGN KEY (video_id) REFERENCES videos (id)
+            )
+        ''')
+        
+        # Таблица для статистики входа/выхода
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS line_statistics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                video_id INTEGER,
+                in_count INTEGER DEFAULT 0,
+                out_count INTEGER DEFAULT 0,
+                FOREIGN KEY (video_id) REFERENCES videos (id)
+            )
+        ''')
+        
+        # Таблица для настроек обработки
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS processing_settings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                video_id INTEGER,
+                settings_json TEXT NOT NULL,
+                FOREIGN KEY (video_id) REFERENCES videos (id)
+            )
+        ''')
+        
+        conn.commit()
+
+def save_video_info(conn, video_info):
+    """Сохраняет информацию о видео"""
+    cursor = conn.execute('''
+        INSERT INTO videos (filename, frame_count, processed_frames, duration_seconds, resolution, fps)
+        VALUES (?, ?, ?, ?, ?, ?)
+    ''', (
+        video_info['filename'],
+        video_info['frame_count'],
+        video_info['processed_frames'],
+        video_info['duration_seconds'],
+        video_info['resolution'],
+        video_info['fps']
+    ))
+    return cursor.lastrowid
+
+def save_people_data(conn, video_id, people_data):
+    """Сохраняет данные о людях"""
+    for person in people_data:
+        waiting_minutes = None
+        if person["Ожидание"] != "-":
+            try:
+                waiting_minutes = float(person["Ожидание"].replace(" мин", ""))
+            except:
+                waiting_minutes = 0.0
+        
+        conn.execute('''
+            INSERT INTO people (video_id, person_id, appearance_time, disappearance_time, waiting_minutes, reid_enabled)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (
+            video_id,
+            person["ID"],
+            person["Появление"],
+            person["Исчезновение"] if person["Исчезновение"] != "-" else None,
+            waiting_minutes,
+            person["ReID"] == "✓"
+        ))
+
+def save_train_events(conn, video_id, train_events):
+    """Сохраняет события поездов"""
+    for event in train_events:
+        duration = None
+        if event["Прибытие"] and event["Убытие"]:
+            try:
+                t1 = datetime.strptime(event["Прибытие"], "%H:%M:%S")
+                t2 = datetime.strptime(event["Убытие"], "%H:%M:%S")
+                duration = (t2 - t1).total_seconds()
+            except:
+                duration = None
+        
+        conn.execute('''
+            INSERT INTO train_events (video_id, arrival_time, departure_time, duration_seconds)
+            VALUES (?, ?, ?, ?)
+        ''', (video_id, event["Прибытие"], event["Убытие"], duration))
+
+def save_occupancy(conn, video_id, occupancy):
+    """Сохраняет данные о загруженности"""
+    for occ in occupancy:
+        conn.execute('''
+            INSERT INTO occupancy (video_id, timestamp, people_count)
+            VALUES (?, ?, ?)
+        ''', (video_id, occ["time"], occ["people"]))
+
+def save_color_analysis(conn, video_id, color_analysis):
+    """Сохраняет анализ цветов"""
+    for color_data in color_analysis:
+        conn.execute('''
+            INSERT INTO color_analysis (video_id, frame_index, gray_percent, orange_percent, red_percent, combined_percent)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (
+            video_id,
+            color_data["frame"],
+            color_data["gray"],
+            color_data["orange"],
+            color_data["red"],
+            color_data["combined"]
+        ))
+
+def save_line_statistics(conn, video_id, in_count, out_count):
+    """Сохраняет статистику линии"""
+    conn.execute('''
+        INSERT INTO line_statistics (video_id, in_count, out_count)
+        VALUES (?, ?, ?)
+    ''', (video_id, in_count, out_count))
+
+def save_processing_settings(conn, video_id, settings):
+    """Сохраняет настройки обработки"""
+    conn.execute('''
+        INSERT INTO processing_settings (video_id, settings_json)
+        VALUES (?, ?)
+    ''', (video_id, json.dumps(settings)))
+
+def load_previous_analyses():
+    """Загружает список предыдущих анализов"""
+    if not os.path.exists(db_path):
+        return []
+    
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.execute('''
+                SELECT id, filename, processed_date, frame_count, processed_frames 
+                FROM videos 
+                ORDER BY processed_date DESC
+            ''')
+            return cursor.fetchall()
+    except:
+        return []
+
+# Инициализация базы данных
+if db_enabled:
+    init_database()
+
+# ... остальной код (модели, ридеры, хранилища) оставьте без изменений ...
 model = YOLO("yolov8n.pt")
 
 # OCR ридер
@@ -235,9 +456,40 @@ def is_in_train_zone(x1, y1, x2, y2, frame_width, frame_height):
     
     return in_zone or overlap_ratio > 0.3, (zone_x1, zone_y1, zone_x2, zone_y2)
 
+# --- Панель управления базами данных ---
+st.sidebar.header("Управление данными")
+
+if db_enabled:
+    # Показать предыдущие анализы
+    previous_analyses = load_previous_analyses()
+    if previous_analyses:
+        st.sidebar.subheader("Предыдущие анализы")
+        for analysis in previous_analyses:
+            st.sidebar.write(f"{analysis['filename']} - {analysis['processed_date']}")
+
+# Загрузка видео
 uploaded_file = st.file_uploader("Загрузи видео с платформы", type=["mp4", "avi", "mov"])
 
 if uploaded_file:
+    # Сохраняем настройки для базы данных
+    processing_settings = {
+        "confidence": confidence,
+        "line_y": line_y,
+        "skip_frames": skip_frames,
+        "resize_factor": resize_factor,
+        "disable_ocr": disable_ocr,
+        "ocr_x": ocr_x,
+        "ocr_y": ocr_y,
+        "ocr_width": ocr_width,
+        "ocr_height": ocr_height,
+        "train_zone_x": train_zone_x,
+        "train_zone_width": train_zone_width,
+        "train_zone_y": train_zone_y,
+        "train_zone_height": train_zone_height,
+        "reid_threshold": reid_threshold,
+        "enable_reid": enable_reid
+    }
+    
     tfile = tempfile.NamedTemporaryFile(delete=False)
     tfile.write(uploaded_file.read())
     video_path = tfile.name
@@ -246,13 +498,14 @@ if uploaded_file:
     fps = cap.get(cv2.CAP_PROP_FPS)
     original_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     original_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    duration = frame_count / fps if fps > 0 else 0
     
     process_w = int(original_w * resize_factor)
     process_h = int(original_h * resize_factor)
 
     stframe = st.empty()
     progress = st.progress(0)
-    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
     # Для поезда
     train_present = False
@@ -557,6 +810,37 @@ if uploaded_file:
 
     cap.release()
 
+    # === Сохранение в базу данных ===
+    if db_enabled:
+        try:
+            with get_db_connection() as conn:
+                # Сохраняем информацию о видео
+                video_info = {
+                    'filename': uploaded_file.name,
+                    'frame_count': frame_count,
+                    'processed_frames': processed_frames,
+                    'duration_seconds': duration,
+                    'resolution': f"{original_w}x{original_h}",
+                    'fps': fps
+                }
+                
+                video_id = save_video_info(conn, video_info)
+                
+                # Сохраняем все данные
+                save_people_data(conn, video_id, people_data)
+                save_train_events(conn, video_id, train_events)
+                save_occupancy(conn, video_id, occupancy)
+                save_color_analysis(conn, video_id, color_analysis_data)
+                save_line_statistics(conn, video_id, line.in_count, line.out_count)
+                save_processing_settings(conn, video_id, processing_settings)
+                
+                conn.commit()
+                
+                st.success(f"✅ Данные успешно сохранены в базу данных (ID: {video_id})")
+                
+        except Exception as e:
+            st.error(f"❌ Ошибка при сохранении в базу данных: {e}")
+
     # === Дашборд ===
     st.success(f"Обработка завершена! Обработано {processed_frames} кадров из {frame_count}")
 
@@ -611,3 +895,62 @@ if uploaded_file:
 
     st.subheader("Вход/Выход")
     st.write(f"Вошло: {line.in_count} Вышло: {line.out_count}")
+
+# --- Просмотр данных из базы ---
+if db_enabled and os.path.exists(db_path):
+    st.sidebar.header("Просмотр данных из БД")
+    
+    if st.sidebar.button("Показать историю анализов"):
+        with get_db_connection() as conn:
+            # Получаем список видео
+            videos = conn.execute('''
+                SELECT id, filename, processed_date, frame_count, processed_frames 
+                FROM videos 
+                ORDER BY processed_date DESC
+            ''').fetchall()
+            
+            if videos:
+                st.subheader("📋 История анализов видео")
+                for video in videos:
+                    with st.expander(f"{video['filename']} - {video['processed_date']}"):
+                        st.write(f"ID: {video['id']}")
+                        st.write(f"Кадров: {video['frame_count']} (обработано: {video['processed_frames']})")
+                        
+                        # Статистика по людям
+                        people_stats = conn.execute(
+                            'SELECT COUNT(*) as total_people FROM people WHERE video_id = ?', 
+                            (video['id'],)
+                        ).fetchone()
+                        st.wrf"Всего людей: {people_stats['total_people']}")
+                        
+                        # Статистика по поездам
+                        train_stats = conn.execute(
+                            'SELECT COUNT(*) as total_trains FROM train_events WHERE video_id = ?', 
+                            (video['id'],)
+                        ).fetchone()
+                        st.write(f"Событий поездов: {train_stats['total_trains']}")
+                        
+                        if st.button(f"Загрузить данные видео ID {video['id']}", key=f"load_{video['id']}"):
+                            # Загружаем данные для этого видео
+                            people_data_db = conn.execute(
+                                'SELECT person_id, appearance_time, disappearance_time, waiting_minutes, reid_enabled FROM people WHERE video_id = ?',
+                                (video['id'],)
+                            ).fetchall()
+                            
+                            train_events_db = conn.execute(
+                                'SELECT arrival_time, departure_time, duration_seconds FROM train_events WHERE video_id = ?',
+                                (video['id'],)
+                            ).fetchall()
+                            
+                            # Показываем данные
+                            if people_data_db:
+                                st.subheader("Люди из БД")
+                                df_people_db = pd.DataFrame(people_data_db)
+                                st.dataframe(df_people_db)
+                            
+                            if train_events_db:
+                                st.subheader("Поезда из БД")
+                                df_train_db = pd.DataFrame(train_events_db)
+                                st.dataframe(df_train_db)
+            else:
+                st.info("В базе данных нет записей")
