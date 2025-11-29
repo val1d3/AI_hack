@@ -954,3 +954,4 @@ if db_enabled and os.path.exists(db_path):
                                 st.dataframe(df_train_db)
             else:
                 st.info("В базе данных нет записей")
+                fdlmgk;dfglk'dflgnlkdfglk
